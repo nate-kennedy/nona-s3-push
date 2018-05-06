@@ -1,0 +1,79 @@
+#! /bin/bash
+
+# Build Vars
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+VERSION=$(cat $DIR/../version)
+
+
+# Build Script
+versionCheck() {
+    if git rev-parse ${VERSION} >/dev/null 2>&1 && [[ $CURRENT_BRANCH == master ]]; then
+        echo "Found tag"
+        exit 1
+    fi
+}
+
+buildContainer() {
+    cd $DIR/..
+    docker build -t nona-s3-push .
+}
+
+testContainer() {
+    cd $DIR/..
+    
+    # Fetch Archive from S3
+    eval $(aws ecr get-login --no-include-email --region us-east-1)
+    tmpdir=/tmp/$RANDOM
+    mkdir ${tmpdir}
+    docker run --env AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} \
+        --env AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY} \
+        --env NONA_S3_BUCKET=${NONA_S3_BUCKET} \
+        --volume ${tmpdir}:/data \
+        nona-s3-pull:latest
+
+    # Create S3 Mock & wait for service
+    docker network create test-net
+    docker run -d -p 9000:9000 --name minio1 \
+        --network test-net \
+        -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
+        -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+        minio/minio server /data
+    minio_ip=$(docker inspect minio1 | jq -r '.[0].NetworkSettings.Networks."test-net".IPAddress')
+
+    while true; do
+        sleep 10
+        nc -vz localhost 9000 -w 3
+        if [[ $? -eq 0 ]]; then
+            break
+        fi
+    done
+
+    export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+    export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    aws --endpoint-url http://localhost:9000 s3 mb s3://test-bucket
+
+    # Test nona-s3-push
+    docker run --env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
+        --network test-net \
+        --env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
+        --env NONA_S3_BUCKET=test-bucket \
+        --env NONA_S3_ENDPOINT=http://${minio_ip}:9000 \
+        --volume ${tmpdir}:/data \
+        nona-s3-push
+
+    items=$(aws --endpoint-url http://localhost:9000 s3 ls s3://test-bucket/backup/development/ | wc -l | tr -d '[:space:]')
+
+    docker stop minio1 && docker rm minio1 
+    docker network rm test-net
+    if [[ $items -ne 2 ]]; then
+        echo "Was expecting two items in S3. Got '${items}'."
+        exit 1
+    fi
+
+    echo "Test completed."
+}
+
+versionCheck
+buildContainer
+testContainer
+
